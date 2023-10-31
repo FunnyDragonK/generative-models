@@ -127,18 +127,23 @@ class GeneralConditioner(nn.Module):
         return batch
 
     def forward(
-        self, batch: Dict, force_zero_embeddings: Optional[List] = None
+        self, batch: Dict, force_zero_embeddings: Optional[List] = None, embedding_manager=None
     ) -> Dict:
         output = dict()
         if force_zero_embeddings is None:
             force_zero_embeddings = []
         for embedder in self.embedders:
             embedding_context = nullcontext if embedder.is_trainable else torch.no_grad
+            if type(embedder) in [FrozenCLIPEmbedder, FrozenOpenCLIPEmbedder2] and embedding_manager is not None:
+                embedding_context = nullcontext
             with embedding_context():
                 if hasattr(embedder, "input_key") and (embedder.input_key is not None):
                     if embedder.legacy_ucg_val is not None:
                         batch = self.possibly_get_ucg_val(embedder, batch)
-                    emb_out = embedder(batch[embedder.input_key])
+                    if embedder.input_key == 'txt' and type(embedder) in [FrozenCLIPEmbedder, FrozenOpenCLIPEmbedder2]:
+                        emb_out = embedder(batch[embedder.input_key], embedding_manager=embedding_manager)
+                    else:
+                        emb_out = embedder(batch[embedder.input_key])
                 elif hasattr(embedder, "input_keys"):
                     emb_out = embedder(*[batch[k] for k in embedder.input_keys])
             assert isinstance(
@@ -173,7 +178,7 @@ class GeneralConditioner(nn.Module):
         return output
 
     def get_unconditional_conditioning(
-        self, batch_c, batch_uc=None, force_uc_zero_embeddings=None
+        self, batch_c, batch_uc=None, force_uc_zero_embeddings=None, embedding_manager=None
     ):
         if force_uc_zero_embeddings is None:
             force_uc_zero_embeddings = []
@@ -181,7 +186,7 @@ class GeneralConditioner(nn.Module):
         for embedder in self.embedders:
             ucg_rates.append(embedder.ucg_rate)
             embedder.ucg_rate = 0.0
-        c = self(batch_c)
+        c = self(batch_c, embedding_manager=embedding_manager)
         uc = self(batch_c if batch_uc is None else batch_uc, force_uc_zero_embeddings)
 
         for embedder, rate in zip(self.embedders, ucg_rates):
@@ -366,6 +371,7 @@ class FrozenCLIPEmbedder(AbstractEmbModel):
         self.layer = layer
         self.layer_idx = layer_idx
         self.return_pooled = always_return_pooled
+        self.transformer.to(self.device)
         if layer == "hidden":
             assert layer_idx is not None
             assert 0 <= abs(layer_idx) <= 12
@@ -377,19 +383,27 @@ class FrozenCLIPEmbedder(AbstractEmbModel):
             param.requires_grad = False
 
     @autocast
-    def forward(self, text):
-        batch_encoding = self.tokenizer(
-            text,
-            truncation=True,
-            max_length=self.max_length,
-            return_length=True,
-            return_overflowing_tokens=False,
-            padding="max_length",
-            return_tensors="pt",
-        )
-        tokens = batch_encoding["input_ids"].to(self.device)
+    def forward(self, text, embedding_manager=None):
+        # adapt embedding manager
+        flag = True
+        if type(text) is not list and type(text) is not str:
+            flag = False
+        if flag:
+            batch_encoding = self.tokenizer(
+                text,
+                truncation=True,
+                max_length=self.max_length,
+                return_length=True,
+                return_overflowing_tokens=False,
+                padding="max_length",
+                return_tensors="pt",
+            )
+            tokens = batch_encoding["input_ids"].to(self.device)
+        else:
+            tokens = text.to(self.device)
         outputs = self.transformer(
-            input_ids=tokens, output_hidden_states=self.layer == "hidden"
+            input_ids=tokens, output_hidden_states=self.layer == "hidden",
+            embedding_manager=embedding_manager
         )
         if self.layer == "last":
             z = outputs.last_hidden_state
@@ -453,9 +467,9 @@ class FrozenOpenCLIPEmbedder2(AbstractEmbModel):
             param.requires_grad = False
 
     @autocast
-    def forward(self, text):
+    def forward(self, text, embedding_manager=None):
         tokens = open_clip.tokenize(text)
-        z = self.encode_with_transformer(tokens.to(self.device))
+        z = self.encode_with_transformer(tokens.to(self.device), embedding_manager=embedding_manager)
         if not self.return_pooled and self.legacy:
             return z
         if self.return_pooled:
@@ -463,8 +477,12 @@ class FrozenOpenCLIPEmbedder2(AbstractEmbModel):
             return z[self.layer], z["pooled"]
         return z[self.layer]
 
-    def encode_with_transformer(self, text):
+    def encode_with_transformer(self, text, embedding_manager=None):
         x = self.model.token_embedding(text)  # [batch_size, n_ctx, d_model]
+        # texual inversion
+        if embedding_manager is not None:
+            x = embedding_manager(text, x, oc=True)
+
         x = x + self.model.positional_embedding
         x = x.permute(1, 0, 2)  # NLD -> LND
         x = self.text_transformer_forward(x, attn_mask=self.model.attn_mask)

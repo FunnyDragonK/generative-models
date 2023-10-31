@@ -36,8 +36,8 @@ class StandardDiffusionLoss(nn.Module):
 
         self.batch2model_keys = set(batch2model_keys)
 
-    def __call__(self, network, denoiser, conditioner, input, batch):
-        cond = conditioner(batch)
+    def __call__(self, network, denoiser, conditioner, input, batch, embedding_manager=None, control_net=None):
+        cond = conditioner(batch, embedding_manager=embedding_manager)
         additional_model_inputs = {
             key: batch[key] for key in self.batch2model_keys.intersection(batch)
         }
@@ -49,9 +49,14 @@ class StandardDiffusionLoss(nn.Module):
                 torch.randn(input.shape[0], device=input.device), input.ndim
             )
         noised_input = input + noise * append_dims(sigmas, input.ndim)
-        model_output = denoiser(
-            network, noised_input, sigmas, cond, **additional_model_inputs
-        )
+        if control_net is not None:
+            model_output = denoiser(
+                network, noised_input, sigmas, cond, control_net, **additional_model_inputs
+            )
+        else:
+            model_output = denoiser(
+                network, noised_input, sigmas, cond, **additional_model_inputs
+            )
         w = append_dims(denoiser.w(sigmas), input.ndim)
         return self.get_loss(model_output, input, w)
 

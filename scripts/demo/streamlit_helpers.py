@@ -553,6 +553,7 @@ def do_sample(
                     batch,
                     batch_uc=batch_uc,
                     force_uc_zero_embeddings=force_uc_zero_embeddings,
+                    embedding_manager=model.embedding_manager,
                 )
                 unload_model(model.conditioner)
 

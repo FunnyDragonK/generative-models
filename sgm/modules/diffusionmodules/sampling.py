@@ -54,8 +54,11 @@ class BaseDiffusionSampler:
 
         return x, s_in, sigmas, num_sigmas, cond, uc
 
-    def denoise(self, x, denoiser, sigma, cond, uc):
-        denoised = denoiser(*self.guider.prepare_inputs(x, sigma, cond, uc))
+    def denoise(self, x, denoiser, sigma, cond, uc, control_net=None, hint=None):
+        if control_net is None:
+            denoised = denoiser(*self.guider.prepare_inputs(x, sigma, cond, uc))
+        else:
+            denoised = denoiser(*self.guider.prepare_inputs(x, sigma, cond, uc), control_net, hint=hint)
         denoised = self.guider(denoised, sigma)
         return denoised
 
@@ -93,13 +96,14 @@ class EDMSampler(SingleStepDiffusionSampler):
         self.s_tmax = s_tmax
         self.s_noise = s_noise
 
-    def sampler_step(self, sigma, next_sigma, denoiser, x, cond, uc=None, gamma=0.0):
+    def sampler_step(self, sigma, next_sigma, denoiser, x, cond, uc=None, gamma=0.0,
+                     control_net=None, hint=None):
         sigma_hat = sigma * (gamma + 1.0)
         if gamma > 0:
             eps = torch.randn_like(x) * self.s_noise
             x = x + eps * append_dims(sigma_hat**2 - sigma**2, x.ndim) ** 0.5
+        denoised = self.denoise(x, denoiser, sigma_hat, cond, uc, control_net=control_net, hint=hint)
 
-        denoised = self.denoise(x, denoiser, sigma_hat, cond, uc)
         d = to_d(x, sigma_hat, denoised)
         dt = append_dims(next_sigma - sigma_hat, x.ndim)
 
@@ -109,7 +113,7 @@ class EDMSampler(SingleStepDiffusionSampler):
         )
         return x
 
-    def __call__(self, denoiser, x, cond, uc=None, num_steps=None):
+    def __call__(self, denoiser, x, cond, uc=None, num_steps=None, control_net=None, hint=None):
         x, s_in, sigmas, num_sigmas, cond, uc = self.prepare_sampling_loop(
             x, cond, uc, num_steps
         )
@@ -128,6 +132,8 @@ class EDMSampler(SingleStepDiffusionSampler):
                 cond,
                 uc,
                 gamma,
+                control_net=control_net,
+                hint=hint,
             )
 
         return x

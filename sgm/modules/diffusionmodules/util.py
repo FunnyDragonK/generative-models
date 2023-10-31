@@ -160,7 +160,7 @@ def checkpoint(func, inputs, params, flag):
                    explicitly take as arguments.
     :param flag: if False, disable gradient checkpointing.
     """
-    if flag:
+    if False:
         args = tuple(inputs) + tuple(params)
         return CheckpointFunction.apply(func, len(inputs), *args)
     else:
@@ -184,6 +184,8 @@ class CheckpointFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *output_grads):
+        print(f'run_function: {ctx.run_function}')
+        print(f'ctx type is {type(ctx)}')
         ctx.input_tensors = [x.detach().requires_grad_(True) for x in ctx.input_tensors]
         with torch.enable_grad(), torch.cuda.amp.autocast(**ctx.gpu_autocast_kwargs):
             # Fixes a bug where the first op in run_function modifies the
@@ -191,6 +193,12 @@ class CheckpointFunction(torch.autograd.Function):
             # Tensors.
             shallow_copies = [x.view_as(x) for x in ctx.input_tensors]
             output_tensors = ctx.run_function(*shallow_copies)
+        print('ctx.input_tensors')
+        for item in ctx.input_tensors:
+            print(f'shape {item.shape}, grad {item.requires_grad}')
+        print('ctx.input_params')
+        for item in ctx.input_params:
+            print(f'shape {item.shape}, grad {item.requires_grad}')
         input_grads = torch.autograd.grad(
             output_tensors,
             ctx.input_tensors + ctx.input_params,

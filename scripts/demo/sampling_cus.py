@@ -1,9 +1,8 @@
 # change working directory to the root of the project
 import os
-# os.chdir("../../")
 import sys
-sys.path.append(".")
-#
+sys.path.append("../../")
+
 from pytorch_lightning import seed_everything
 
 from scripts.demo.streamlit_helpers import *
@@ -46,7 +45,7 @@ VERSION2SPECS = {
         "C": 4,
         "f": 8,
         "is_legacy": False,
-        "config": "configs/inference/sd_xl_base.yaml",
+        "config": "../../configs/inference/sd_xl_base_ti.yaml",
         "ckpt": "checkpoints/sd_xl_base_1.0.safetensors",
     },
     "SDXL-base-0.9": {
@@ -147,22 +146,21 @@ def run_txt2img(
     sampler, num_rows, num_cols = init_sampling(stage2strength=stage2strength)
     num_samples = num_rows * num_cols
 
-    if st.button("Sample"):
-        st.write(f"**Model I:** {version}")
-        out = do_sample(
-            state["model"],
-            sampler,
-            value_dict,
-            num_samples,
-            H,
-            W,
-            C,
-            F,
-            force_uc_zero_embeddings=["txt"] if not is_legacy else [],
-            return_latents=return_latents,
-            filter=filter,
-        )
-        return out
+    st.write(f"**Model I:** {version}")
+    out = do_sample(
+        state["model"],
+        sampler,
+        value_dict,
+        num_samples,
+        H,
+        W,
+        C,
+        F,
+        force_uc_zero_embeddings=["txt"] if not is_legacy else [],
+        return_latents=return_latents,
+        filter=filter,
+    )
+    return out
 
 
 def run_img2img(
@@ -270,8 +268,8 @@ if __name__ == "__main__":
     else:
         add_pipeline = False
 
-    seed = st.sidebar.number_input("seed", value=42, min_value=0, max_value=int(1e9))
-    seed_everything(seed)
+    # seed = st.sidebar.number_input("seed", value=42, min_value=0, max_value=int(1e9))
+    # seed_everything(seed)
 
     save_locally, save_path = init_save_locally(os.path.join(SAVE_PATH, version))
 
@@ -282,10 +280,10 @@ if __name__ == "__main__":
 
     is_legacy = version_dict["is_legacy"]
 
-    prompt = st.text_input(
-        "prompt",
-        "Astronaut in a jungle, cold color palette, muted colors, detailed, 8k",
-    )
+    # prompt = st.text_input(
+    #     "prompt",
+    #     "Astronaut in a jungle, cold color palette, muted colors, detailed, 8k",
+    # )
     if is_legacy:
         negative_prompt = st.text_input("negative prompt", "")
     else:
@@ -319,46 +317,52 @@ if __name__ == "__main__":
         finish_denoising = st.checkbox("Finish denoising with refiner.", True)
         if not finish_denoising:
             stage2strength = None
+    obstacle_names = ['lawn, big pebble, low viewing angle, photography, phone camera']
+    for i in range(600):
+        # uniformly sample a obstacle
+        # obstacle = obstacle_names[i % 5]
+        obstacle = 'stone_v4'
+        # prompt = f'home lawn, {obstacle}, low viewing angle, photography, phone camera'
+        # prompt = 'lawn, garden stone, low viewing angle, photography, phone camera'
+        prompt = '* on the table'
+        if mode == "txt2img":
+            out = run_txt2img(
+                state,
+                version,
+                version_dict,
+                is_legacy=is_legacy,
+                return_latents=add_pipeline,
+                filter=state.get("filter"),
+                stage2strength=stage2strength,
+            )
+        elif mode == "img2img":
+            out = run_img2img(
+                state,
+                version_dict,
+                is_legacy=is_legacy,
+                return_latents=add_pipeline,
+                filter=state.get("filter"),
+                stage2strength=stage2strength,
+            )
+        else:
+            raise ValueError(f"unknown mode {mode}")
+        if isinstance(out, (tuple, list)):
+            samples, samples_z = out
+        else:
+            samples = out
+            samples_z = None
 
-    if mode == "txt2img":
-        out = run_txt2img(
-            state,
-            version,
-            version_dict,
-            is_legacy=is_legacy,
-            return_latents=add_pipeline,
-            filter=state.get("filter"),
-            stage2strength=stage2strength,
-        )
-    elif mode == "img2img":
-        out = run_img2img(
-            state,
-            version_dict,
-            is_legacy=is_legacy,
-            return_latents=add_pipeline,
-            filter=state.get("filter"),
-            stage2strength=stage2strength,
-        )
-    else:
-        raise ValueError(f"unknown mode {mode}")
-    if isinstance(out, (tuple, list)):
-        samples, samples_z = out
-    else:
-        samples = out
-        samples_z = None
-
-    if add_pipeline and samples_z is not None:
-        st.write("**Running Refinement Stage**")
-        samples = apply_refiner(
-            samples_z,
-            state2,
-            sampler2,
-            samples_z.shape[0],
-            prompt=prompt,
-            negative_prompt=negative_prompt if is_legacy else "",
-            filter=state.get("filter"),
-            finish_denoising=finish_denoising,
-        )
-
-    if save_locally and samples is not None:
+        if add_pipeline and samples_z is not None:
+            st.write("**Running Refinement Stage**")
+            samples = apply_refiner(
+                samples_z,
+                state2,
+                sampler2,
+                samples_z.shape[0],
+                prompt=prompt,
+                negative_prompt=negative_prompt if is_legacy else "",
+                filter=state.get("filter"),
+                finish_denoising=finish_denoising,
+            )
+        save_path = f'./res/{obstacle}'
         perform_save_locally(save_path, samples)

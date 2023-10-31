@@ -1,7 +1,9 @@
+import os
 from contextlib import contextmanager
 from typing import Any, Dict, List, Tuple, Union
 
 import pytorch_lightning as pl
+from pytorch_lightning.utilities.rank_zero import rank_zero_only
 import torch
 from omegaconf import ListConfig, OmegaConf
 from safetensors.torch import load_file as load_safetensors
@@ -25,6 +27,7 @@ class DiffusionEngine(pl.LightningModule):
         network_config,
         denoiser_config,
         first_stage_config,
+        personalization_config=None,
         conditioner_config: Union[None, Dict, ListConfig, OmegaConf] = None,
         sampler_config: Union[None, Dict, ListConfig, OmegaConf] = None,
         optimizer_config: Union[None, Dict, ListConfig, OmegaConf] = None,
@@ -40,8 +43,11 @@ class DiffusionEngine(pl.LightningModule):
         log_keys: Union[List, None] = None,
         no_cond_log: bool = False,
         compile_model: bool = False,
+        unfreeze_model: bool = False
     ):
         super().__init__()
+        self.control_model=None
+        self.unfreeze_model = unfreeze_model
         self.log_keys = log_keys
         self.input_key = input_key
         self.optimizer_config = default(
@@ -61,6 +67,27 @@ class DiffusionEngine(pl.LightningModule):
         self.conditioner = instantiate_from_config(
             default(conditioner_config, UNCONDITIONAL_CONFIG)
         )
+        # ---------------------texual inversion-----------------------------
+        if not self.unfreeze_model:
+            self.conditioner.eval()
+            self.conditioner.train = disabled_train
+            for param in self.conditioner.parameters():
+                param.requires_grad = False
+
+            self.model.eval()
+            self.model.train = disabled_train
+            for param in self.model.parameters():
+                param.requires_grad = False
+        
+        if personalization_config is not None:
+            self.embedding_manager = self.instantiate_embedding_manager(personalization_config, self.conditioner)
+
+            for param in self.embedding_manager.embedding_parameters():
+                param.requires_grad = True
+        else:
+            self.embedding_manager = None
+        # ---------------------texual inversion-----------------------------
+
         self.scheduler_config = scheduler_config
         self._init_first_stage(first_stage_config)
 
@@ -102,6 +129,14 @@ class DiffusionEngine(pl.LightningModule):
         if len(unexpected) > 0:
             print(f"Unexpected Keys: {unexpected}")
 
+    def instantiate_embedding_manager(self, config, embedder):
+        model = instantiate_from_config(config, embedder=embedder)
+
+        if config.params.get("embedding_manager_ckpt", None): # do not load if missing OR empty string
+            model.load(config.params.embedding_manager_ckpt)
+        
+        return model
+
     def _init_first_stage(self, config):
         model = instantiate_from_config(config).eval()
         model.train = disabled_train
@@ -129,7 +164,8 @@ class DiffusionEngine(pl.LightningModule):
         return z
 
     def forward(self, x, batch):
-        loss = self.loss_fn(self.model, self.denoiser, self.conditioner, x, batch)
+        loss = self.loss_fn(self.model, self.denoiser, self.conditioner, x, batch,
+                            embedding_manager=self.embedding_manager, control_net=self.control_model)
         loss_mean = loss.mean()
         loss_dict = {"loss": loss_mean}
         return loss_mean, loss_dict
@@ -139,6 +175,17 @@ class DiffusionEngine(pl.LightningModule):
         x = self.encode_first_stage(x)
         batch["global_step"] = self.global_step
         loss, loss_dict = self(x, batch)
+        if self.embedding_manager is not None:
+            temp = self.embedding_manager.string_to_param_dict['*']
+            temp1 = self.embedding_manager.initial_embeddings['*']
+
+            temp_oc = self.embedding_manager.string_to_param_dict_oc['*']
+            temp1_oc = self.embedding_manager.initial_embeddings_oc['*']
+
+            loss_dis = self.embedding_manager.embedding_to_coarse_loss()
+            loss += loss_dis
+            print(f'temp: {torch.norm(temp.squeeze())}, temp_oc: {torch.norm(temp_oc.squeeze())}')
+            print(f'temp1: {torch.norm(temp1.squeeze())}, temp1_oc: {torch.norm(temp1_oc.squeeze())}')
         return loss, loss_dict
 
     def training_step(self, batch, batch_idx):
@@ -173,6 +220,17 @@ class DiffusionEngine(pl.LightningModule):
         if self.use_ema:
             self.model_ema(self.model)
 
+    @rank_zero_only
+    def on_save_checkpoint(self, checkpoint):
+
+        if not self.unfreeze_model: # If we are not tuning the model itself, zero-out the checkpoint content to preserve memory.
+            checkpoint.clear()
+        
+        if os.path.isdir(self.trainer.checkpoint_callback.dirpath):
+            self.embedding_manager.save(os.path.join(self.trainer.checkpoint_callback.dirpath, "embeddings.pt"))
+
+            self.embedding_manager.save(os.path.join(self.trainer.checkpoint_callback.dirpath, f"embeddings_gs-{self.global_step}.pt"))
+
     @contextmanager
     def ema_scope(self, context=None):
         if self.use_ema:
@@ -194,12 +252,28 @@ class DiffusionEngine(pl.LightningModule):
         )
 
     def configure_optimizers(self):
+        self.model.eval()
+        self.model.train = disabled_train
+        for param in self.embedding_manager.embedding_parameters():
+            param.requires_grad = True
+
+
         lr = self.learning_rate
-        params = list(self.model.parameters())
-        for embedder in self.conditioner.embedders:
-            if embedder.is_trainable:
-                params = params + list(embedder.parameters())
-        opt = self.instantiate_optimizer_from_config(params, lr, self.optimizer_config)
+        if self.embedding_manager is not None: # If using textual inversion
+            embedding_params = list(self.embedding_manager.embedding_parameters())
+
+            if self.unfreeze_model: # Are we allowing the base model to train? If so, set two different parameter groups.
+                model_params = list(self.cond_stage_model.parameters()) + list(self.model.parameters())
+                opt = torch.optim.AdamW([{"params": embedding_params, "lr": lr}, {"params": model_params}], lr=self.model_lr)
+            else: # Otherwise, train only embedding
+                print(f"Setting up AdamW: lr={lr}, weight_decay={1e-2}")
+                opt = torch.optim.AdamW(embedding_params, lr=lr)
+        else:
+            params = list(self.model.parameters())
+            for embedder in self.conditioner.embedders:
+                if embedder.is_trainable:
+                    params = params + list(embedder.parameters())
+            opt = self.instantiate_optimizer_from_config(params, lr, self.optimizer_config)
         if self.scheduler_config is not None:
             scheduler = instantiate_from_config(self.scheduler_config)
             print("Setting up LambdaLR scheduler...")
@@ -295,6 +369,7 @@ class DiffusionEngine(pl.LightningModule):
             force_uc_zero_embeddings=ucg_keys
             if len(self.conditioner.embedders) > 0
             else [],
+            embedding_manager=self.embedding_manager
         )
 
         sampling_kwargs = {}

@@ -5,7 +5,7 @@ import inspect
 import os
 import sys
 # set CUDA_VISIBLE_DEVICES before importing torch
-# os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2,3"
 from inspect import Parameter
 from typing import Union
 
@@ -24,6 +24,7 @@ from pytorch_lightning.callbacks import Callback
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.trainer import Trainer
 from pytorch_lightning.utilities import rank_zero_only
+from pytorch_lightning.strategies import FSDPStrategy
 from sgm.util import exists, instantiate_from_config, isheatmap
 from sgm.data.base import Txt2ImgIterableBaseDataset
 from torch.utils.data import DataLoader, Dataset
@@ -785,15 +786,15 @@ if __name__ == "__main__":
 
         # model
         model = instantiate_from_config(config.model)
-        ckpt = './checkpoints/sd_xl_base_1.0.safetensors'
-        sd = load_safetensors(ckpt)
-        m, u = model.load_state_dict(sd, strict=False)
-
-        if len(m) > 0:
-            print("missing keys:")
-            print(m)
-        if len(u) > 0:
-            print("unexpected keys:")
+        # ckpt = './checkpoints/sd_xl_base_1.0.safetensors'
+        # sd = load_safetensors(ckpt)
+        # m, u = model.load_state_dict(sd, strict=False)
+        #
+        # if len(m) > 0:
+        #     print("missing keys:")
+        #     print(m)
+        # if len(u) > 0:
+        #     print("unexpected keys:")
  
 
         # trainer and callbacks
@@ -989,7 +990,10 @@ if __name__ == "__main__":
                 config.model.base_learning_rate,
             )
         if not cpu:
-            ngpu = len(lightning_config.trainer.devices.strip(",").split(","))
+            if type(lightning_config.trainer.devices) == str:
+                ngpu = len(lightning_config.trainer.devices.strip(",").split(","))
+            elif type(lightning_config.trainer.devices) == int:
+                ngpu = lightning_config.trainer.devices
         else:
             ngpu = 1
         if "accumulate_grad_batches" in lightning_config.trainer:
@@ -1036,6 +1040,7 @@ if __name__ == "__main__":
         if opt.train:
             try:
                 trainer.fit(model, data, ckpt_path=ckpt_resume_path)
+                trainer.print(torch.cuda.memory_summary())
             except Exception:
                 if not opt.debug:
                     melk()
